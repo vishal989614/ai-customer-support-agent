@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+mysql-connector-python
+python-dotenv
+langchain
+langchain-community
+langchain-huggingface
+langgraph
+chromadb 
+langchain-chroma
+sentence-transformers
+google-genai
