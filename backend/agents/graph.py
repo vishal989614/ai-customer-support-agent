@@ -18,7 +18,6 @@ from .nodes import (
     generate_response
 )
 
-from .router import capability_router
 
 def build_support_graph():
 
@@ -80,11 +79,13 @@ def build_support_graph():
         "understand_request"
     )
 
-     # Select capability
+    # Select capability
 
     graph.add_conditional_edges(
         "understand_request",
-        capability_router,
+
+        lambda state: state["capability"],
+        
         {
             "rag": "rag",
             "order": "order",
@@ -97,7 +98,7 @@ def build_support_graph():
 
     # Execute → Verify
 
-    graph.add_edge("rag", "verify")
+    graph.add_edge("rag", END)
     graph.add_edge("order", "verify")
     graph.add_edge("payment", "verify")
     graph.add_edge("restaurant", "verify")

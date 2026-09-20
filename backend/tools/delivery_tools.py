@@ -1,6 +1,21 @@
-def get_delivery_status(order_id: int):
+from services.delivery_service import (
+    get_user_delivery_status
+)
 
-    return {
-        "status": "NOT_IMPLEMENTED",
-        "message": "Delivery tool will be implemented next."
-    }
+
+def get_delivery_status(
+    user_id: int
+):
+
+    if user_id is None:
+
+        return {
+            "found": False,
+            "error": (
+                "User authentication required."
+            )
+        }
+
+    return get_user_delivery_status(
+        user_id
+    )
