@@ -1,3 +1,4 @@
+from typing import Optional, List
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -26,6 +27,9 @@ class ChatRequest(BaseModel):
 
     question: str
     user_id: int
+    context: Optional[List[str]] = None
+    order_id: Optional[int] = None
+    ticket_id: Optional[int] = None
 
 
 # ==========================================
@@ -49,12 +53,18 @@ def chat(
     request: ChatRequest
 ):
 
-    result = support_agent.invoke(
-        {
-            "question": request.question,
-            "user_id": request.user_id
-        }
-    )
+    payload = {
+        "question": request.question,
+        "user_id": request.user_id
+    }
+    if request.context:
+        payload["context"] = request.context
+    if request.order_id:
+        payload["order_id"] = request.order_id
+    if request.ticket_id:
+        payload["ticket_id"] = request.ticket_id
+
+    result = support_agent.invoke(payload)
 
     return {
     "question": request.question,

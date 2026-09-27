@@ -32,6 +32,12 @@ from .state import SupportState
 def understand_request(state: SupportState) -> SupportState:
 
     question = state["question"]
+    context_list = state.get("context", [])
+    if context_list:
+        context_str = "\n".join(str(c) for c in context_list[-6:])
+        user_query_for_prompt = f"Recent conversation context:\n{context_str}\n\nCurrent customer message:\n{question}"
+    else:
+        user_query_for_prompt = question
 
     prompt = f"""
 You are an intent classification system for a food delivery
@@ -59,6 +65,7 @@ order:
 - Order status
 - Order details
 - Cancel order
+- Asking which restaurant the order is from
 
 payment:
 - Payment status
@@ -118,6 +125,18 @@ ORDER INTENTS:
 → capability = "order"
 → intent = "track_order"
 
+"What restaurant is it from?"
+→ capability = "order"
+→ intent = "order_details"
+
+"What restaurant is my order from?"
+→ capability = "order"
+→ intent = "order_details"
+
+"Where is my food from?"
+→ capability = "order"
+→ intent = "order_details"
+
 "What is my order status?"
 → capability = "order"
 → intent = "order_status"
@@ -128,6 +147,14 @@ ORDER INTENTS:
 
 
 PAYMENT INTENTS:
+
+"What's the payment status?"
+→ capability = "payment"
+→ intent = "payment_status"
+
+"What is the status of my payment?"
+→ capability = "payment"
+→ intent = "payment_status"
 
 "What is my payment status for order 3?"
 → capability = "payment"
@@ -187,7 +214,11 @@ If the user wants human support or wants to create a ticket:
 → intent = "human_escalation"
 
 
-If the user wants to view one specific ticket:
+If the user wants to view one specific ticket or check their tickets:
+
+"What is the status of my support ticket?"
+→ capability = "human"
+→ intent = "my_tickets"
 
 "What is the status of support ticket 7?"
 → capability = "human"
@@ -198,9 +229,6 @@ If the user wants to view one specific ticket:
 → capability = "human"
 → intent = "ticket_status"
 → ticket_id = 7
-
-
-If the user wants to see all their tickets:
 
 "Show my support tickets"
 → capability = "human"
@@ -216,6 +244,12 @@ support ticket, use:
 → intent = "update_ticket"
 
 Examples:
+
+"Mark my ticket as resolved"
+→ new_status = "RESOLVED"
+
+"Resolve my ticket"
+→ new_status = "RESOLVED"
 
 "Mark support ticket 7 as resolved"
 → ticket_id = 7
@@ -252,44 +286,8 @@ IN_PROGRESS
 RESOLVED
 CLOSED
 
-For update_ticket, ALWAYS extract ticket_id
-and new_status when they are present.
-
-Do not classify a status update as ticket_status.
-
-For example:
-
-"Mark ticket 7 as resolved"
-must be:
-
-capability = "human"
-intent = "update_ticket"
-
-NOT:
-
-intent = "ticket_status"
-
-
-HUMAN ESCALATION:
-
-If creating a new support ticket, determine:
-
-issue_type:
-- PAYMENT_ISSUE
-- ORDER_ISSUE
-- DELIVERY_ISSUE
-- RESTAURANT_ISSUE
-- ACCOUNT_ISSUE
-- GENERAL_SUPPORT
-
-priority:
-- LOW
-- MEDIUM
-- HIGH
-
-If capability is not human, use null
-for issue_type and priority.
-
+For update_ticket, extract ticket_id if mentioned,
+and new_status.
 
 Return EXACTLY this JSON structure:
 
@@ -321,9 +319,9 @@ Rules:
 
 - Return JSON only.
 
-User question:
+User question / input:
 
-{question}
+{user_query_for_prompt}
 """
 
     try:
@@ -360,6 +358,59 @@ User question:
         state["new_status"] = data.get("new_status")
 
         # ------------------------------------------------
+        # DETERMINISTIC ENTITY EXTRACTION FALLBACK
+        # ------------------------------------------------
+        import re
+
+        # Extract order_id if not captured by Gemini
+        if not state.get("order_id"):
+            m = re.search(r"(?:order|order id|order #)\s*#?\s*(\d+)", question, re.IGNORECASE)
+            if not m:
+                m = re.search(r"#(\d{3,5})", question)
+            if m:
+                state["order_id"] = int(m.group(1))
+
+        # Extract ticket_id if not captured by Gemini
+        if not state.get("ticket_id"):
+            m = re.search(r"(?:ticket|ticket id|support ticket|ticket #)\s*#?\s*(\d+)", question, re.IGNORECASE)
+            if m:
+                state["ticket_id"] = int(m.group(1))
+
+        # Extract payment_id if not captured by Gemini
+        if not state.get("payment_id"):
+            m = re.search(r"(?:payment|payment id|txn)\s*#?\s*(\d+)", question, re.IGNORECASE)
+            if m:
+                state["payment_id"] = int(m.group(1))
+
+        # Extract restaurant_name if not captured by Gemini
+        if not state.get("restaurant_name"):
+            known_rests = [
+                "Pizza Palace", "Burger Hub", "Spice Garden", 
+                "Biryani House", "South Express", "The Chinese Bowl", 
+                "Green Leaf", "Cafe Coffee Corner", "Delhi Zaika", "Pizza Hub", "Burger Point"
+            ]
+            for r_name in known_rests:
+                if r_name.lower() in question.lower():
+                    state["restaurant_name"] = r_name
+                    break
+
+        # ------------------------------------------------
+        # DETERMINISTIC ORDER & PAYMENT ROUTING OVERRIDES
+        # ------------------------------------------------
+
+        # If question asks which restaurant the order is from
+        if re.search(r"(?:what|which)\s+restaurant\s+(?:is\s+(?:it|my\s+order|this)\s+from|from)", question, re.IGNORECASE) or \
+           re.search(r"where\s+is\s+(?:it|my\s+order|my\s+food)\s+from", question, re.IGNORECASE):
+            if not state.get("restaurant_name"):
+                state["capability"] = "order"
+                state["intent"] = "order_details"
+
+        # If question asks about payment status
+        if re.search(r"(?:payment\s+status|status\s+of\s+(?:my\s+)?payment)", question, re.IGNORECASE):
+            state["capability"] = "payment"
+            state["intent"] = "payment_status"
+
+        # ------------------------------------------------
         # DETERMINISTIC SUPPORT TICKET STATUS HANDLING
         # ------------------------------------------------
 
@@ -380,6 +431,14 @@ User question:
             for word in status_update_words
         )
 
+        # If inquiry about ticket status (not update)
+        if re.search(r"(?:status\s+of\s+(?:my\s+)?(?:support\s+)?ticket)", question_lower) and not is_status_update:
+            state["capability"] = "human"
+            if not state.get("ticket_id"):
+                state["intent"] = "my_tickets"
+            else:
+                state["intent"] = "ticket_status"
+
         if is_status_update:
 
             # Status update is ALWAYS a human capability
@@ -391,8 +450,6 @@ User question:
             # --------------------------------------------
 
             if state.get("ticket_id") is None:
-
-                import re
 
                 match = re.search(
                     r"(?:ticket|support ticket)\s*#?\s*(\d+)",
@@ -490,14 +547,16 @@ def order_node(state: SupportState) -> SupportState:
     # --------------------------------------------------------
 
     if intent == "track_order":
-
         result = get_order_status(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            order_data = result.get("order", {})
+            if order_data:
+                state["order_id"] = order_data.get("order_id") or order_data.get("id") or state.get("order_id")
+                state["restaurant_name"] = order_data.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # --------------------------------------------------------
@@ -505,14 +564,16 @@ def order_node(state: SupportState) -> SupportState:
     # --------------------------------------------------------
 
     if intent == "order_status":
-
         result = get_order_status(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            order_data = result.get("order", {})
+            if order_data:
+                state["order_id"] = order_data.get("order_id") or order_data.get("id") or state.get("order_id")
+                state["restaurant_name"] = order_data.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # --------------------------------------------------------
@@ -520,14 +581,16 @@ def order_node(state: SupportState) -> SupportState:
     # --------------------------------------------------------
 
     if intent == "order_details":
-
         result = get_order_details(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            order_data = result.get("order", {})
+            if order_data:
+                state["order_id"] = order_data.get("order_id") or order_data.get("id") or state.get("order_id")
+                state["restaurant_name"] = order_data.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # --------------------------------------------------------
@@ -535,10 +598,8 @@ def order_node(state: SupportState) -> SupportState:
     # --------------------------------------------------------
 
     if intent == "cancel_order":
-
         # Specific order ID is required for safe cancellation.
         if order_id is None:
-
             state["tool_result"] = {
                 "success": False,
                 "confirmation_required": True,
@@ -547,16 +608,20 @@ def order_node(state: SupportState) -> SupportState:
                     "you want to cancel."
                 )
             }
-
             return state
 
         result = cancel_order(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict):
+            if result.get("success"):
+                state["new_status"] = "CANCELLED"
+            order_data = result.get("order", {})
+            if order_data:
+                state["order_id"] = order_data.get("order_id") or order_data.get("id") or state.get("order_id")
+                state["restaurant_name"] = order_data.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # --------------------------------------------------------
@@ -567,7 +632,6 @@ def order_node(state: SupportState) -> SupportState:
         "found": False,
         "error": "Unsupported order request."
     }
-
     return state
 
 
@@ -582,33 +646,36 @@ def payment_node(state: SupportState) -> SupportState:
     intent = state.get("intent")
 
     if user_id is None:
-
         state["tool_result"] = {
             "found": False,
             "error": "User authentication required."
         }   
         return state
 
+    # Resolve order_id from active order if not provided
     if order_id is None:
-        state["tool_result"] = {
-            "found": False,
-            "error": "Order ID is required."
-        }
-        return state
+        from services.order_service import get_active_order
+        act = get_active_order(user_id)
+        if act.get("found"):
+            order_id = act["order"]["order_id"]
+            state["order_id"] = order_id
 
     # -----------------------------
     # PAYMENT STATUS
     # -----------------------------
 
     if intent == "payment_status":
-
         result = get_payment_status(
             user_id=user_id,
             order_id=order_id
-            )
-
+        )
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            pym = result.get("payment", {})
+            if pym:
+                state["payment_id"] = pym.get("payment_id") or pym.get("id") or state.get("payment_id")
+                state["order_id"] = pym.get("order_id") or state.get("order_id")
+                state["restaurant_name"] = pym.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # -----------------------------
@@ -616,14 +683,17 @@ def payment_node(state: SupportState) -> SupportState:
     # -----------------------------
 
     if intent == "refund_status":
-
         result = get_payment_status(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            pym = result.get("payment", {})
+            if pym:
+                state["payment_id"] = pym.get("payment_id") or pym.get("id") or state.get("payment_id")
+                state["order_id"] = pym.get("order_id") or state.get("order_id")
+                state["restaurant_name"] = pym.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # -----------------------------
@@ -631,14 +701,24 @@ def payment_node(state: SupportState) -> SupportState:
     # -----------------------------
 
     if intent == "refund_request":
+        if order_id is None:
+            state["tool_result"] = {
+                "success": False,
+                "error": "Order ID is required for refund."
+            }
+            return state
 
         result = refund_payment(
             user_id=user_id,
             order_id=order_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict):
+            pym = result.get("payment", {})
+            if pym:
+                state["payment_id"] = pym.get("payment_id") or pym.get("id") or state.get("payment_id")
+                state["order_id"] = pym.get("order_id") or state.get("order_id")
+                state["restaurant_name"] = pym.get("restaurant_name") or state.get("restaurant_name")
         return state
 
     # -----------------------------
@@ -649,7 +729,6 @@ def payment_node(state: SupportState) -> SupportState:
         "found": False,
         "error": "Unsupported payment request."
     }
-
     return state
 
 
@@ -661,19 +740,45 @@ def restaurant_node(state: SupportState) -> SupportState:
 
     restaurant_name = state.get("restaurant_name")
     restaurant_id = state.get("restaurant_id")
+    user_id = state.get("user_id")
+    order_id = state.get("order_id")
+    order_info = None
+
+    # If neither restaurant name nor ID was provided, resolve from user's active/specified order
+    if not restaurant_name and not restaurant_id:
+        from services.order_service import get_active_order, get_order_by_id
+        if order_id and user_id:
+            res = get_order_by_id(user_id, order_id)
+            if res.get("found"):
+                order_info = res.get("order")
+        elif user_id:
+            res = get_active_order(user_id)
+            if res.get("found"):
+                order_info = res.get("order")
+
+        if order_info:
+            restaurant_name = order_info.get("restaurant_name")
+            restaurant_id = order_info.get("restaurant_id")
+            state["restaurant_name"] = restaurant_name
+            state["restaurant_id"] = restaurant_id
+            state["order_id"] = order_info.get("order_id")
 
     # --------------------------------------------------------
     # Search by restaurant name
     # --------------------------------------------------------
 
     if restaurant_name:
-
         result = get_restaurant_by_name(
             restaurant_name
         )
-
+        if order_info and result and isinstance(result, dict):
+            result["order"] = order_info
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            rest = result.get("restaurant", {})
+            if rest:
+                state["restaurant_name"] = rest.get("name") or state.get("restaurant_name")
+                state["restaurant_id"] = rest.get("id") or state.get("restaurant_id")
         return state
 
     # --------------------------------------------------------
@@ -681,13 +786,17 @@ def restaurant_node(state: SupportState) -> SupportState:
     # --------------------------------------------------------
 
     if restaurant_id:
-
         result = get_restaurant_information(
             restaurant_id
         )
-
+        if order_info and result and isinstance(result, dict):
+            result["order"] = order_info
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            rest = result.get("restaurant", {})
+            if rest:
+                state["restaurant_name"] = rest.get("name") or state.get("restaurant_name")
+                state["restaurant_id"] = rest.get("id") or state.get("restaurant_id")
         return state
 
     # --------------------------------------------------------
@@ -698,7 +807,6 @@ def restaurant_node(state: SupportState) -> SupportState:
         "found": False,
         "error": "Restaurant name or restaurant ID is required."
     }
-
     return state
 
 
@@ -711,17 +819,20 @@ def delivery_node(state: SupportState) -> SupportState:
     user_id = state.get("user_id")
 
     if user_id is None:
-
         state["tool_result"] = {
             "found": False,
             "error": "User authentication required."
         }
-
         return state
 
     result = get_delivery_status(user_id)
-
     state["tool_result"] = result
+
+    if result and isinstance(result, dict) and result.get("found"):
+        order_data = result.get("order", {})
+        if order_data:
+            state["order_id"] = order_data.get("order_id") or order_data.get("id") or state.get("order_id")
+            state["restaurant_name"] = order_data.get("restaurant_name") or state.get("restaurant_name")
 
     return state
 
@@ -734,33 +845,41 @@ def human_node(state: SupportState) -> SupportState:
     user_id = state.get("user_id")
     order_id = state.get("order_id") 
     ticket_id = state.get("ticket_id")
-    question = state.get("question")
+    question = state.get("question", "")
 
     intent = state.get("intent")
 
     if user_id is None:
-    
         state["tool_result"] = {
             "success": False,
             "error": "User authentication required."
         }
-
         return state
     
     # 1. CREATE SUPPORT TICKET
 
     if intent == "human_escalation":
+        # Resolve order_id from active order if not provided
+        if order_id is None:
+            from services.order_service import get_active_order
+            act = get_active_order(user_id)
+            if act.get("found"):
+                order_id = act["order"]["order_id"]
+                state["order_id"] = order_id
 
         issue_type = state.get(
             "issue_type",
             "GENERAL_SUPPORT"
         )
-
         priority = state.get(
             "priority",
             "MEDIUM"
         )
-        
+        if "missing" in question.lower() or "food" in question.lower():
+            if issue_type in ("GENERAL_SUPPORT", None):
+                issue_type = "ORDER_ISSUE"
+                priority = "HIGH"
+
         result = escalate_to_human(
             user_id=user_id,
             order_id=order_id,
@@ -768,36 +887,53 @@ def human_node(state: SupportState) -> SupportState:
             description=question,
             priority=priority
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("success"):
+            state["ticket_id"] = result.get("ticket_id") or state.get("ticket_id")
         return state
 
     # 2. GET SPECIFIC TICKET
 
     if intent == "ticket_status":
+        if ticket_id is None:
+            my_res = get_my_tickets(user_id)
+            if my_res.get("found") and my_res.get("tickets"):
+                tickets = my_res["tickets"]
+                open_t = [t for t in tickets if t.get("status") not in ("RESOLVED", "CLOSED")]
+                chosen = open_t[0] if open_t else tickets[0]
+                ticket_id = chosen.get("id")
+                state["ticket_id"] = ticket_id
+                state["tool_result"] = {"found": True, "ticket": chosen}
+                return state
 
         result = get_ticket(
             user_id=user_id,
             ticket_id=ticket_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            t = result.get("ticket", {})
+            if t:
+                state["ticket_id"] = t.get("id") or state.get("ticket_id")
+                state["order_id"] = t.get("order_id") or state.get("order_id")
         return state
 
     # 3. GET USER'S TICKETS
 
     if intent == "my_tickets":
-
         result = get_my_tickets(
             user_id=user_id
         )
-
         state["tool_result"] = result
-
+        if result and isinstance(result, dict) and result.get("found"):
+            tickets = result.get("tickets", [])
+            if tickets:
+                open_t = [t for t in tickets if t.get("status") not in ("RESOLVED", "CLOSED")]
+                chosen = open_t[0] if open_t else tickets[0]
+                state["ticket_id"] = chosen.get("id") or state.get("ticket_id")
+                if chosen.get("order_id"):
+                    state["order_id"] = state.get("order_id") or chosen.get("order_id")
         return state
-
 
     # 4. UPDATE TICKET
     if intent == "update_ticket":
@@ -805,9 +941,21 @@ def human_node(state: SupportState) -> SupportState:
         new_status = state.get("new_status")
 
         if ticket_id is None:
+            # Fallback to the user's latest open ticket
+            my_res = get_my_tickets(user_id)
+            if my_res.get("found") and my_res.get("tickets"):
+                tickets = my_res["tickets"]
+                open_t = [t for t in tickets if t.get("status") not in ("RESOLVED", "CLOSED")]
+                if open_t:
+                    ticket_id = open_t[0].get("id")
+                elif tickets:
+                    ticket_id = tickets[0].get("id")
+                state["ticket_id"] = ticket_id
+
+        if ticket_id is None:
             state["tool_result"] = {
                 "success": False,
-                "error": "Ticket ID is required."
+                "error": "No support ticket found to update. Please provide your Ticket ID."
             }
             return state
 
@@ -1514,6 +1662,12 @@ Rules:
    information.
 
 10. Answer exactly what the customer asked.
+
+11. If the customer asks what restaurant their order is from (or "what restaurant is it from?"), answer directly with the restaurant name, cuisine, and address from the verified tool result.
+
+12. If the tool result confirms that a support ticket was updated (e.g. resolved), clearly state that support ticket #[ticket_id] has been marked as [new_status].
+
+13. If the tool result contains payment information, clearly report the payment status (e.g. COMPLETED), payment method, and amount for the customer's order.
 
 For human escalation:
 
